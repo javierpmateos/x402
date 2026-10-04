@@ -16,6 +16,21 @@ import { findDefaultAsset } from "../../defaultAssets";
 import { resolveCardanoPolicies } from "../../policy";
 import type { ClientCardanoSigner } from "../../signer";
 import type { ExactCardanoPayload } from "../../types";
+import {
+  assertCommitmentEmbedded,
+  resolveClientRequestCommitment,
+  type RequestCommitmentRequestProvider,
+} from "../requestCommitment/client";
+
+/** Optional client behaviour. */
+export interface ExactCardanoSchemeOptions {
+  /**
+   * Supplies the request being paid for. Needed to honor a server's
+   * `cardano-request-commitment`: the client recomputes the commitment from this
+   * request and refuses to pay if it does not match the one the server declared.
+   */
+  requestCommitmentRequest?: RequestCommitmentRequestProvider;
+}
 
 /**
  * Cardano client implementation for the Exact payment scheme.
@@ -33,8 +48,12 @@ export class ExactCardanoScheme implements SchemeNetworkClient {
    * Creates a new Cardano client scheme.
    *
    * @param signer - The Cardano client signer.
+   * @param options - Optional client behaviour.
    */
-  constructor(private readonly signer: ClientCardanoSigner) {}
+  constructor(
+    private readonly signer: ClientCardanoSigner,
+    private readonly options: ExactCardanoSchemeOptions = {},
+  ) {}
 
   /**
    * Builds a Cardano payment payload by delegating signing to the configured
@@ -43,8 +62,8 @@ export class ExactCardanoScheme implements SchemeNetworkClient {
    *
    * @param x402Version - The x402 protocol version.
    * @param paymentRequirements - The payment requirements to fulfill.
-   * @param context - Payment-required context (unused; Masumi registry claims
-   *   are validated by the facilitator against `PaymentPayload.resource`).
+   * @param context - Payment-required context; its `extensions` carry a
+   *   `cardano-request-commitment` declaration when the server asks for one.
    * @returns A promise resolving to the Cardano payment payload.
    */
   async createPaymentPayload(
@@ -52,7 +71,6 @@ export class ExactCardanoScheme implements SchemeNetworkClient {
     paymentRequirements: PaymentRequirements,
     context?: PaymentPayloadContext,
   ): Promise<PaymentPayloadResult> {
-    void context;
     if (!isCardanoNetwork(paymentRequirements.network)) {
       throw new Error(`Unsupported Cardano network: ${paymentRequirements.network}`);
     }
@@ -83,6 +101,11 @@ export class ExactCardanoScheme implements SchemeNetworkClient {
       throw new Error("Cardano payment requirements carry an invalid confirmation policy");
     }
 
+    const requestCommitment = await resolveClientRequestCommitment(
+      context?.extensions,
+      this.options.requestCommitmentRequest,
+    );
+
     const result = await this.signer.buildAndSignPaymentTransaction({
       network: paymentRequirements.network,
       payTo: paymentRequirements.payTo,
@@ -90,6 +113,7 @@ export class ExactCardanoScheme implements SchemeNetworkClient {
       amount: paymentRequirements.amount,
       maxTimeoutSeconds: paymentRequirements.maxTimeoutSeconds,
       extra: paymentRequirements.extra,
+      ...(requestCommitment ? { requestCommitment } : {}),
     });
 
     if (!result || typeof result.transaction !== "string" || result.transaction.length === 0) {
@@ -97,6 +121,10 @@ export class ExactCardanoScheme implements SchemeNetworkClient {
     }
     if (!result.nonce || !CARDANO_UTXO_REF_REGEX.test(result.nonce)) {
       throw new Error(`Cardano signer returned an invalid nonce: ${result.nonce}`);
+    }
+
+    if (requestCommitment) {
+      assertCommitmentEmbedded(result.transaction, requestCommitment);
     }
 
     const payload: ExactCardanoPayload = {
