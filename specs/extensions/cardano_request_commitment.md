@@ -156,7 +156,7 @@ If the server cannot show that a present commitment is valid, the payment MUST N
 
 Both MUST reject, regardless of `required`. An internal error MUST NOT be turned into success by default.
 
-**Implementation note.** In the TypeScript core, an exception thrown by a `beforeVerify` hook is logged and ignored, and verification continues as if the hook had passed. An implementation of this extension MUST therefore catch every internal error and return an explicit rejection, or it fails open. This behaviour of the core is not specific to this extension and is reported separately.
+**Implementation note.** In the TypeScript core, an exception thrown by a `beforeVerify` hook is logged and ignored, and verification continues as if the hook had passed. An implementation of this extension MUST therefore catch every internal error and return an explicit rejection, or it fails open. This behaviour of the core is not specific to this extension and is reported in [#3689](https://github.com/x402-foundation/x402/issues/3689).
 
 ## Facilitator
 
