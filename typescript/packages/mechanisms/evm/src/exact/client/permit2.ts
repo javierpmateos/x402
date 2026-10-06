@@ -20,18 +20,21 @@ const MAX_UINT256 = BigInt("0xffffffffffffffffffffffffffffffffffffffffffffffffff
  * @param signer - The EVM signer for client operations
  * @param x402Version - The x402 protocol version
  * @param paymentRequirements - The payment requirements
+ * @param nonce - Nonce to sign (uint256, decimal); a fresh random one when omitted
  * @returns Promise resolving to a payment payload result
  */
 export async function createPermit2Payload(
   signer: ClientEvmSigner,
   x402Version: number,
   paymentRequirements: PaymentRequirements,
+  nonce?: string,
 ): Promise<PaymentPayloadResult> {
   return createPermit2PayloadForProxy(
     x402ExactPermit2ProxyAddress,
     signer,
     x402Version,
     paymentRequirements,
+    nonce,
   );
 }
 

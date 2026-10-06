@@ -150,3 +150,6 @@ export {
   PERMIT2_TOKEN_COLLECTOR_ADDRESS,
   resolveAuthCaptureDeployment,
 } from "./auth-capture/constants";
+
+// Request commitment (evm-request-commitment extension)
+export * as requestCommitment from "./exact/requestCommitment";

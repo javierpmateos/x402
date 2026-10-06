@@ -14,6 +14,14 @@ import {
 } from "../../shared/extensions";
 import { findDefaultAsset } from "../../defaultAssets";
 import type { EvmSchemeOptions } from "../../shared/rpc";
+import {
+  formatNonce,
+  parseNonce,
+  requestCommitmentPayloadExtension,
+  resolveClientRequestCommitment,
+  type RequestCommitmentClientOptions,
+  type ResolvedRequestCommitment,
+} from "../requestCommitment";
 
 /**
  * EVM client implementation for the Exact payment scheme.
@@ -39,10 +47,13 @@ export class ExactEvmScheme implements SchemeNetworkClient {
    *   Extension enrichment (EIP-2612 / ERC-20 approval sponsoring) additionally
    *   requires optional capabilities like `readContract` and tx signing helpers.
    * @param options - Optional RPC configuration used to backfill extension capabilities.
+   * @param requestCommitment - Optional request provider (and salt source) used to
+   *   honor a server's `evm-request-commitment` by deriving the nonce from the request.
    */
   constructor(
     private readonly signer: ClientEvmSigner,
     private readonly options?: EvmSchemeOptions,
+    private readonly requestCommitment?: RequestCommitmentClientOptions,
   ) {}
 
   /**
@@ -66,8 +77,25 @@ export class ExactEvmScheme implements SchemeNetworkClient {
     const assetTransferMethod =
       (paymentRequirements.extra?.assetTransferMethod as AssetTransferMethod) ?? "eip3009";
 
+    const commitment = await resolveClientRequestCommitment(
+      context?.extensions,
+      this.requestCommitment,
+    );
+    if (commitment && assetTransferMethod !== "eip3009" && assetTransferMethod !== "permit2") {
+      throw new Error(`Request commitment is not supported for ${assetTransferMethod}`);
+    }
+
     if (assetTransferMethod === "permit2") {
-      const result = await createPermit2Payload(this.signer, x402Version, paymentRequirements);
+      const result = withCommitment(
+        await createPermit2Payload(
+          this.signer,
+          x402Version,
+          paymentRequirements,
+          commitment ? formatNonce(commitment.nonce, "permit2") : undefined,
+        ),
+        commitment,
+        "permit2",
+      );
 
       const eip2612Extensions = await trySignEip2612PermitExtension(
         this.signer,
@@ -80,7 +108,7 @@ export class ExactEvmScheme implements SchemeNetworkClient {
       if (eip2612Extensions) {
         return {
           ...result,
-          extensions: eip2612Extensions,
+          extensions: { ...result.extensions, ...eip2612Extensions },
         };
       }
 
@@ -93,13 +121,52 @@ export class ExactEvmScheme implements SchemeNetworkClient {
       if (erc20Extensions) {
         return {
           ...result,
-          extensions: erc20Extensions,
+          extensions: { ...result.extensions, ...erc20Extensions },
         };
       }
 
       return result;
     }
 
-    return createEIP3009Payload(this.signer, x402Version, paymentRequirements);
+    return withCommitment(
+      await createEIP3009Payload(
+        this.signer,
+        x402Version,
+        paymentRequirements,
+        commitment ? (formatNonce(commitment.nonce, "eip3009") as `0x${string}`) : undefined,
+      ),
+      commitment,
+      "eip3009",
+    );
   }
+}
+
+/**
+ * Confirms the signed nonce is the committed one and attaches the salt.
+ *
+ * @param result - Payload built by the transfer method.
+ * @param commitment - The resolved commitment, if any.
+ * @param method - Transfer method that built the payload.
+ * @returns The payload, with the salt disclosed when a commitment was signed.
+ * @throws When the payload does not carry the committed nonce.
+ */
+function withCommitment(
+  result: PaymentPayloadResult,
+  commitment: ResolvedRequestCommitment | undefined,
+  method: "eip3009" | "permit2",
+): PaymentPayloadResult {
+  if (!commitment) return result;
+  const payload = result.payload as {
+    authorization?: { nonce?: unknown };
+    permit2Authorization?: { nonce?: unknown };
+  };
+  const nonce =
+    method === "eip3009" ? payload.authorization?.nonce : payload.permit2Authorization?.nonce;
+  if (parseNonce(nonce, method) !== commitment.nonce) {
+    throw new Error("Signed payload does not carry the committed nonce");
+  }
+  return {
+    ...result,
+    extensions: { ...result.extensions, ...requestCommitmentPayloadExtension(commitment) },
+  };
 }

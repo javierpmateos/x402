@@ -12,3 +12,10 @@ export {
   type Permit2AllowanceParams,
 } from "./permit2";
 export { erc20AllowanceAbi } from "../../constants";
+export {
+  EVM_REQUEST_COMMITMENT,
+  resolveClientRequestCommitment,
+  type RequestCommitmentClientOptions,
+  type RequestCommitmentRequestProvider,
+  type HttpRequestDescription,
+} from "../requestCommitment";

@@ -11,14 +11,15 @@ import { createNonce, getEvmChainId } from "../../utils";
  * @param signer - The EVM signer for client operations
  * @param x402Version - The x402 protocol version
  * @param paymentRequirements - The payment requirements
+ * @param nonce - Nonce to sign; a fresh random one when omitted
  * @returns Promise resolving to a payment payload result
  */
 export async function createEIP3009Payload(
   signer: ClientEvmSigner,
   x402Version: number,
   paymentRequirements: PaymentRequirements,
+  nonce: `0x${string}` = createNonce(),
 ): Promise<PaymentPayloadResult> {
-  const nonce = createNonce();
   const now = Math.floor(Date.now() / 1000);
 
   const authorization: ExactEIP3009Payload["authorization"] = {

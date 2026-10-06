@@ -585,6 +585,7 @@ export function splitEip2612Signature(signature: string): {
  * @param signer - The EVM client signer
  * @param x402Version - The x402 protocol version
  * @param paymentRequirements - The payment requirements
+ * @param nonce - Nonce to sign (uint256, decimal); a fresh random one when omitted
  * @returns Promise resolving to a payment payload result
  */
 export async function createPermit2PayloadForProxy(
@@ -592,9 +593,9 @@ export async function createPermit2PayloadForProxy(
   signer: ClientEvmSigner,
   x402Version: number,
   paymentRequirements: PaymentRequirements,
+  nonce: string = createPermit2Nonce(),
 ): Promise<PaymentPayloadResult> {
   const now = Math.floor(Date.now() / 1000);
-  const nonce = createPermit2Nonce();
 
   // Lower time bound - allow some clock skew
   const validAfter = "0";
