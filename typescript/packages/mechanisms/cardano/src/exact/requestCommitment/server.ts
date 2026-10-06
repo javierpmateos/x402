@@ -42,8 +42,10 @@ export interface RequestCommitmentServerConfig {
    * Returns the request's content bytes after transfer decoding, and an empty
    * array when there is no body. A parsed body cannot be hashed faithfully, so
    * without this accessor only bodiless GET and HEAD requests are accepted.
+   * May be async (Hono, Next, fetch). It is called more than once per request,
+   * so it must return the same bytes each time without consuming the stream.
    */
-  getRawBody?: (adapter: AdapterLike) => Uint8Array;
+  getRawBody?: (adapter: AdapterLike) => Uint8Array | Promise<Uint8Array>;
 }
 
 /** Abort reasons surfaced by `onBeforeVerify`. */
@@ -101,44 +103,171 @@ function adapterOf(transportContext: unknown): AdapterLike | undefined {
   return ctx?.adapter ?? ctx?.request?.adapter;
 }
 
+/** Characters an authority (host, port, IP literal) may contain. No `/`, `?`, `#`, `@`. */
+const AUTHORITY = /^[A-Za-z0-9.\-:[\]_~%!$&'()*+;=]+$/;
+
 /**
- * Path and query of a request URL exactly as received, fragment excluded.
+ * Lowercases an authority and drops the default port of the scheme, so a Host
+ * header and a runtime-normalized URL authority compare equal.
  *
- * @param url - Absolute URL or origin-form path from the adapter.
- * @returns The path-and-query string.
+ * @param authority - Host and optional port.
+ * @param scheme - `http` or `https`.
+ * @returns The comparable form.
  */
-function pathAndQuery(url: string): string {
-  const absolute = /^[a-z][a-z0-9+.-]*:\/\/[^/?#]*/i.exec(url);
-  const rest = absolute ? url.slice(absolute[0].length) : url;
-  const withoutFragment = rest.split("#")[0];
-  return withoutFragment.startsWith("/") ? withoutFragment : `/${withoutFragment}`;
+function comparableAuthority(authority: string, scheme: string): string {
+  const lower = authority.toLowerCase();
+  const defaultPort = scheme.toLowerCase() === "https" ? ":443" : ":80";
+  return lower.endsWith(defaultPort) ? lower.slice(0, -defaultPort.length) : lower;
 }
 
 /**
- * Without a raw body accessor the server cannot hash a body, so it accepts only
- * requests it can show have none. Header absence alone is not enough (an HTTP/2
- * body needs neither Content-Length nor Transfer-Encoding), hence the method
- * restriction and the parsed-body check.
+ * Path and query of the request as received.
+ *
+ * Adapters build `getUrl()` from client-influenced parts: the scheme
+ * (`X-Forwarded-Proto` behind a trusted proxy), the authority (`Host` or
+ * `X-Forwarded-Host`) and the request target. A crafted value in any of them
+ * could move the boundary between authority and target and let the client
+ * choose the path that gets checked. So the scheme must be exactly `http` or
+ * `https`, the authority headers may hold only authority characters, the URL's
+ * authority must be one of those headers, and the target must be in origin form.
  *
  * @param adapter - HTTP adapter.
- * @returns The empty content.
- * @throws When the request carries, or may carry, a body.
+ * @returns The path-and-query string, starting with a single `/`.
+ * @throws When any input to the URL is ambiguous.
  */
-function bodilessOrThrow(adapter: AdapterLike): Uint8Array {
+function requestTarget(adapter: AdapterLike): string {
+  const hosts: string[] = [];
+  const host = adapter.getHeader("host");
+  if (host !== undefined) hosts.push(host.trim());
+  const forwardedHost = adapter.getHeader("x-forwarded-host");
+  if (forwardedHost !== undefined) hosts.push(...forwardedHost.split(",").map(h => h.trim()));
+  for (const value of hosts) {
+    if (!AUTHORITY.test(value)) throw new Error("Ambiguous Host or X-Forwarded-Host header");
+  }
+  const forwardedProto = adapter.getHeader("x-forwarded-proto");
+  if (forwardedProto !== undefined) {
+    for (const value of forwardedProto.split(",")) {
+      if (!/^https?$/i.test(value.trim())) throw new Error("Ambiguous X-Forwarded-Proto header");
+    }
+  }
+
+  const url = adapter.getUrl();
+  if (url.includes("#")) throw new Error("Request URL must not carry a fragment");
+  let target = url;
+  const absolute = /^(https?):\/\/([^/?]*)/i.exec(url);
+  if (absolute) {
+    const [prefix, scheme, authority] = absolute;
+    const expected = hosts.map(h => comparableAuthority(h, scheme));
+    if (expected.length > 0 && !expected.includes(comparableAuthority(authority, scheme))) {
+      throw new Error("Request URL authority does not match the Host header");
+    }
+    target = url.slice(prefix.length);
+  } else if (/^[a-z][a-z0-9+.-]*:/i.test(url)) {
+    throw new Error("Request URL has an unsupported scheme");
+  }
+  if (!target.startsWith("/") || target.startsWith("//")) {
+    throw new Error("Request target must be in origin form");
+  }
+  return target;
+}
+
+/**
+ * Whether a value is a promise or other thenable.
+ *
+ * @param value - Any value.
+ * @returns True for thenables.
+ */
+function isThenable(value: unknown): value is PromiseLike<unknown> {
+  return typeof (value as { then?: unknown } | null)?.then === "function";
+}
+
+/**
+ * Whether the method and framing headers leave room for a body. Header absence
+ * alone does not prove there is none (an HTTP/2 body needs neither
+ * Content-Length nor Transfer-Encoding), hence the method restriction.
+ *
+ * @param adapter - HTTP adapter.
+ * @returns True when the request may be bodiless by method and headers.
+ */
+function framingAllowsNoBody(adapter: AdapterLike): boolean {
   const method = adapter.getMethod();
   const length = adapter.getHeader("content-length");
-  const parsed = adapter.getBody?.();
-  const parsedEmpty =
+  return (
+    (method === "GET" || method === "HEAD") &&
+    (length === undefined || length.trim() === "0") &&
+    adapter.getHeader("transfer-encoding") === undefined
+  );
+}
+
+/**
+ * Whether a framework-parsed body is empty.
+ *
+ * @param parsed - Parsed body, already awaited.
+ * @returns True when nothing was parsed.
+ */
+function parsedBodyEmpty(parsed: unknown): boolean {
+  return (
     parsed === undefined ||
     parsed === null ||
     parsed === "" ||
-    (typeof parsed === "object" && Object.keys(parsed as object).length === 0);
-  if (
-    (method !== "GET" && method !== "HEAD") ||
-    (length !== undefined && length.trim() !== "0") ||
-    adapter.getHeader("transfer-encoding") !== undefined ||
-    !parsedEmpty
-  ) {
+    (typeof parsed === "object" && Object.keys(parsed as object).length === 0)
+  );
+}
+
+/**
+ * Content bytes used for the digest published in the 402. Advisory only: the
+ * paid retry is checked with {@link bodyForVerification}. When the body is only
+ * available asynchronously, a bodiless GET or HEAD is published with an empty
+ * body and anything else is published without a digest.
+ *
+ * @param adapter - HTTP adapter.
+ * @param config - Server configuration.
+ * @returns The bytes, or undefined when they cannot be known synchronously.
+ * @throws When the request may carry a body the server cannot read.
+ */
+function bodyForDeclaration(
+  adapter: AdapterLike,
+  config: RequestCommitmentServerConfig,
+): Uint8Array | undefined {
+  const source = config.getRawBody ? config.getRawBody(adapter) : adapter.getBody?.();
+  if (isThenable(source)) {
+    Promise.resolve(source).catch(() => undefined);
+    return framingAllowsNoBody(adapter) ? new Uint8Array() : undefined;
+  }
+  if (config.getRawBody) {
+    if (!(source instanceof Uint8Array)) {
+      throw new Error("Raw body accessor must return the content bytes");
+    }
+    return source;
+  }
+  if (!framingAllowsNoBody(adapter) || !parsedBodyEmpty(source)) {
+    throw new Error("Request may carry a body but no raw body accessor is configured");
+  }
+  return new Uint8Array();
+}
+
+/**
+ * Content bytes of the paid request. Without a raw body accessor the server
+ * cannot hash a body, so it accepts only requests it can show have none.
+ *
+ * @param adapter - HTTP adapter.
+ * @param config - Server configuration.
+ * @returns The bytes.
+ * @throws When the request carries, or may carry, a body the server cannot read.
+ */
+async function bodyForVerification(
+  adapter: AdapterLike,
+  config: RequestCommitmentServerConfig,
+): Promise<Uint8Array> {
+  if (config.getRawBody) {
+    const bytes = await config.getRawBody(adapter);
+    if (!(bytes instanceof Uint8Array)) {
+      throw new Error("Raw body accessor must return the content bytes");
+    }
+    return bytes;
+  }
+  const parsed = await adapter.getBody?.();
+  if (!framingAllowsNoBody(adapter) || !parsedBodyEmpty(parsed)) {
     throw new Error("Request may carry a body but no raw body accessor is configured");
   }
   return new Uint8Array();
@@ -150,19 +279,17 @@ function bodilessOrThrow(adapter: AdapterLike): Uint8Array {
  * @param adapter - HTTP adapter.
  * @param config - Server configuration.
  * @param headers - Bound header names.
+ * @param body - Content bytes.
  * @returns The request description.
  */
 function describeRequest(
   adapter: AdapterLike,
   config: RequestCommitmentServerConfig,
   headers: readonly string[],
+  body: Uint8Array,
 ): HttpRequestDescription {
   const origin = config.publicOrigin.replace(/\/+$/, "");
-  const url = validateTargetUri(origin + pathAndQuery(adapter.getUrl()));
-  const body = config.getRawBody ? config.getRawBody(adapter) : bodilessOrThrow(adapter);
-  if (!(body instanceof Uint8Array)) {
-    throw new Error("Raw body accessor must return the content bytes");
-  }
+  const url = validateTargetUri(origin + requestTarget(adapter));
   const values: Record<string, string | undefined> = {};
   for (const name of headers) values[name] = adapter.getHeader(name);
   return { method: adapter.getMethod(), url, body, headers: values };
@@ -195,7 +322,9 @@ export function createRequestCommitmentServerExtension(
       const adapter = adapterOf(transportContext);
       if (!adapter) return declaration;
       const headers = decl.info.bindingParams.headers;
-      const binding = buildHttpBinding(describeRequest(adapter, config, headers), headers);
+      const body = bodyForDeclaration(adapter, config);
+      if (body === undefined) return declaration;
+      const binding = buildHttpBinding(describeRequest(adapter, config, headers, body), headers);
       return { ...decl, info: { ...decl.info, commitment: buildRequestCommitment(binding) } };
     },
 
@@ -206,7 +335,7 @@ export function createRequestCommitmentServerExtension(
         // which would let the payment through unchecked. Every failure here is
         // therefore turned into an explicit rejection.
         try {
-          return verifyCommitment(declaration as Declaration, context);
+          return await verifyCommitment(declaration as Declaration, context);
         } catch (error) {
           return {
             abort: true as const,
@@ -228,7 +357,7 @@ export function createRequestCommitmentServerExtension(
    * @param context.transportContext - Core's transport context.
    * @returns An abort directive, or undefined when the commitment holds.
    */
-  function verifyCommitment(
+  async function verifyCommitment(
     decl: Declaration,
     context: { paymentPayload: { payload: unknown }; transportContext?: unknown },
   ) {
@@ -267,7 +396,10 @@ export function createRequestCommitmentServerExtension(
     // Recomputed from the request that will execute, with the server's own
     // configuration. Nothing here is taken from the client's echo.
     const expected = buildRequestCommitment(
-      buildHttpBinding(describeRequest(adapter, config, headers), headers),
+      buildHttpBinding(
+        describeRequest(adapter, config, headers, await bodyForVerification(adapter, config)),
+        headers,
+      ),
     );
     if (found.metadatum.hash !== expected.digest) {
       return abort(

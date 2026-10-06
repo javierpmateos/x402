@@ -515,6 +515,132 @@ describe("server extension", () => {
     expect(result).toMatchObject({ abort: true });
   });
 
+  it("does not let a Host header move the checked path (payment for A presented on B)", async () => {
+    // Express and Fastify build getUrl() as scheme://Host + target. A Host with
+    // `/`, `?` or `#` would otherwise make the server check /article/A while
+    // serving /article/B.
+    for (const [host, target] of [
+      ["x/article/A#", "/article/B"],
+      ["x/article/A?", "/article/B"],
+      ["api.example.com/article/A", "/article/B"],
+    ]) {
+      const result = await verify(declaration(true), {
+        ...ctx(await signedTx(digest)),
+        transportContext: transport({
+          method: "GET",
+          url: `http://${host}${target}`,
+          headers: { host },
+        }),
+      } as never);
+      expect(result, `${host} ${target}`).toMatchObject({ abort: true });
+    }
+    const forwarded = await verify(declaration(true), {
+      ...ctx(await signedTx(digest)),
+      transportContext: transport({
+        method: "GET",
+        url: "http://x/article/A#/article/B",
+        headers: { "x-forwarded-host": "x/article/A#" },
+      }),
+    } as never);
+    expect(forwarded).toMatchObject({ abort: true });
+    // A well-formed Host still verifies.
+    expect(
+      await verify(declaration(true), {
+        ...ctx(await signedTx(digest)),
+        transportContext: transport({
+          method: "GET",
+          url: "http://api.example.com:8080/article/A",
+          headers: { host: "api.example.com:8080" },
+        }),
+      } as never),
+    ).toBeUndefined();
+  });
+
+  it("does not let X-Forwarded-Proto, an absolute-form target or a foreign authority move the path", async () => {
+    const tx = await signedTx(digest);
+    for (const [headers, url] of [
+      [
+        { host: "api.example.com", "x-forwarded-proto": "https://x/y?u=https" },
+        "https://x/y?u=https://api.example.com/article/A",
+      ],
+      [{ host: "api.example.com" }, "https://x/article/A"],
+      [{ host: "host" }, "http://hosthttp://evil/article/A"],
+      [{}, "http://x//article/A"],
+      [{ host: "user@api.example.com" }, "http://user@api.example.com/article/A"],
+    ] as Array<[Record<string, string>, string]>) {
+      const result = await verify(declaration(true), {
+        ...ctx(tx),
+        transportContext: transport({ method: "GET", url, headers }),
+      } as never);
+      expect(result, url).toMatchObject({ abort: true });
+    }
+    for (const [headers, url] of [
+      [{ host: "API.example.com:443" }, "https://api.example.com/article/A"],
+      [{ host: "[::1]:3000" }, "http://[::1]:3000/article/A"],
+      [
+        {
+          host: "internal:8080",
+          "x-forwarded-host": "api.example.com",
+          "x-forwarded-proto": "https",
+        },
+        "https://api.example.com/article/A",
+      ],
+    ] as Array<[Record<string, string>, string]>) {
+      const result = await verify(declaration(true), {
+        ...ctx(tx),
+        transportContext: transport({ method: "GET", url, headers }),
+      } as never);
+      expect(result, url).toBeUndefined();
+    }
+  });
+
+  it("rejects a crafted X-Forwarded-Proto or a `//` target even without a Host header", async () => {
+    const victim = buildRequestCommitment(
+      buildHttpBinding(
+        {
+          ...SPEC_REQUEST,
+          url: "https://api.example.com/fetch?u=https://api.example.com/article/A",
+        },
+        [],
+      ),
+    ).digest;
+    expect(
+      await verify(declaration(true), {
+        ...ctx(await signedTx(victim)),
+        transportContext: transport({
+          method: "GET",
+          url: "https://x/fetch?u=https://api.example.com/article/A",
+          headers: { "x-forwarded-proto": "https://x/fetch?u=https" },
+        }),
+      } as never),
+    ).toMatchObject({ abort: true });
+    const doubleSlash = buildRequestCommitment(
+      buildHttpBinding({ ...SPEC_REQUEST, url: "https://api.example.com//article/A" }, []),
+    ).digest;
+    expect(
+      await verify(declaration(true), {
+        ...ctx(await signedTx(doubleSlash)),
+        transportContext: transport({ method: "GET", url: "http://x//article/A" }),
+      } as never),
+    ).toMatchObject({ abort: true });
+  });
+
+  it("awaits an async parsed body: empty is accepted, non-empty is rejected", async () => {
+    const tx = await signedTx(digest);
+    const withBody = (parsedBody: unknown) => ({
+      ...ctx(tx),
+      transportContext: transport({ method: "GET", url: "/article/A", parsedBody }),
+    });
+    expect(
+      await verify(declaration(true), withBody(Promise.resolve(undefined)) as never),
+    ).toBeUndefined();
+    expect(
+      await verify(declaration(false), withBody(Promise.resolve({ q: "x" })) as never),
+    ).toMatchObject({
+      abort: true,
+    });
+  });
+
   it("refuses a GET whose framework parsed a body, without a raw body accessor", async () => {
     const result = await verify(declaration(false), {
       ...ctx(await signedTx(digest)),
