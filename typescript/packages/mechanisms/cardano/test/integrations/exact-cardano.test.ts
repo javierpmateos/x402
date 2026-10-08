@@ -36,6 +36,7 @@ import {
   buildRequestCommitment,
   createRequestCommitmentServerExtension,
   declareRequestCommitmentExtension,
+  randomSalt,
 } from "../../src/exact/requestCommitment";
 import { decodeCardanoTransaction, slotToPosixMs } from "../../src/utils";
 import { buildSignedTx, getFixtureInputSnapshot } from "../helpers/buildSignedTx";
@@ -962,7 +963,9 @@ describe.skipIf(!LIVE_READY)("Cardano Integration Tests (live preprod)", () => {
   it("settles a payment carrying a request commitment and the chain records it", async () => {
     const ORIGIN = "https://api.example.com";
     const request = { method: "GET", url: `${ORIGIN}/article/A`, headers: {} };
-    const expected = buildRequestCommitment(buildHttpBinding(request, [])).digest;
+    // A fresh salt per run, fixed here only so the test knows what lands on-chain.
+    const salt = randomSalt();
+    const expected = buildRequestCommitment(buildHttpBinding(request, []), salt).digest;
     const adapter = {
       getHeader: () => undefined,
       getMethod: () => "GET",
@@ -983,7 +986,10 @@ describe.skipIf(!LIVE_READY)("Cardano Integration Tests (live preprod)", () => {
       schemes: [
         {
           network: NETWORK,
-          client: new ExactCardanoClient(clientSigner, { requestCommitmentRequest: () => request }),
+          client: new ExactCardanoClient(clientSigner, {
+            requestCommitmentRequest: () => request,
+            requestCommitmentSalt: () => salt,
+          }),
         },
       ],
       spendControls: false,

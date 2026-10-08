@@ -1,4 +1,5 @@
 import { sha256 } from "@noble/hashes/sha2.js";
+import { randomBytes } from "@noble/hashes/utils.js";
 
 import type { MasumiCommitmentPart, MasumiInputCommitment } from "../../types";
 import { commitmentPartDigest, computeInputHash } from "../masumi/digests";
@@ -15,6 +16,9 @@ export type RequestCommitmentProfile = (typeof REQUEST_COMMITMENT_PROFILES)[numb
 
 /** Name of the mandatory commitment part that carries the request binding. */
 export const REQUEST_PART_NAME = "request";
+
+/** Name of the commitment part that carries the client's salt. */
+export const SALT_PART_NAME = "salt";
 
 /**
  * Domain member of the binding object. Same structure and rules as the `http:1`
@@ -161,17 +165,65 @@ export function requestPart(binding: HttpRequestBinding): MasumiCommitmentPart {
 }
 
 /**
+ * Checks a salt: exactly 32 bytes as 64 lowercase hex characters.
+ *
+ * @param salt - Candidate salt.
+ * @returns The same salt.
+ * @throws When the salt is not 64 lowercase hex characters.
+ */
+export function validateSalt(salt: unknown): string {
+  if (typeof salt !== "string" || !HEX_32.test(salt)) {
+    throw new Error("Request commitment salt must be 32 bytes of lowercase hex");
+  }
+  return salt;
+}
+
+/**
+ * Fresh 32-byte salt from a cryptographically secure source.
+ *
+ * @returns 64 lowercase hex characters.
+ */
+export function randomSalt(): string {
+  return hex(randomBytes(32));
+}
+
+/**
+ * The `salt` commitment part. Its content is the salt as a JSON string, so its
+ * digest is SHA-256 of `UTF8(JCS(salt))`, the same rule as any other `jcs` part.
+ * Like the request part, it carries no `content`: the server learns the salt
+ * from the payment payload, never from the chain.
+ *
+ * @param salt - 64 lowercase hex characters.
+ * @returns The commitment part.
+ */
+export function saltPart(salt: string): MasumiCommitmentPart {
+  return {
+    name: SALT_PART_NAME,
+    canonicalization: "jcs",
+    digest: hex(sha256(encoder.encode(JSON.stringify(validateSalt(salt))))),
+  };
+}
+
+/**
  * Builds the full commitment (Masumi `inputCommitment` construction) whose
  * first part is the request binding.
  *
+ * Without a salt this is the commitment the server publishes in the 402: one
+ * `request` part. With a salt it is the commitment the buyer signs into the
+ * transaction: the `request` part followed by a `salt` part.
+ *
  * @param binding - The request binding.
+ * @param salt - The buyer's salt, for the on-chain commitment.
  * @returns The commitment with its digest.
  */
-export function buildRequestCommitment(binding: HttpRequestBinding): MasumiInputCommitment {
+export function buildRequestCommitment(
+  binding: HttpRequestBinding,
+  salt?: string,
+): MasumiInputCommitment {
   const commitment: MasumiInputCommitment = {
     version: "1",
     algorithm: "sha256",
-    parts: [requestPart(binding)],
+    parts: salt === undefined ? [requestPart(binding)] : [requestPart(binding), saltPart(salt)],
     digest: "",
   };
   commitment.digest = computeInputHash(commitment);

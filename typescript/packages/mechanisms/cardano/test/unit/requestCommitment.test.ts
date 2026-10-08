@@ -28,7 +28,9 @@ import {
   declareRequestCommitmentExtension,
   encodeRequestCommitmentMetadatum,
   readRequestCommitment,
+  requestCommitmentPayloadExtension,
   resolveClientRequestCommitment,
+  validateSalt,
   validateBoundHeaders,
   validateTargetUri,
   type HttpRequestDescription,
@@ -53,6 +55,9 @@ const SPEC_REQUEST: HttpRequestDescription = {
   url: "https://api.example.com/article/A",
   headers: {},
 };
+
+/** Fixed salt of the published vectors: bytes 0x00..0x1f. */
+const SALT = "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f";
 
 /** Minimal HTTP adapter for the server extension. */
 function adapter(request: {
@@ -226,6 +231,37 @@ describe("test vector", () => {
       "d90103a100a1190192a2617066687474703a3161685820556fb70df9929f3ebd96b8b51b772374a9d38379b3983f820bf5e4629bd34e68",
     );
   });
+
+  it("matches the published salted vector (the value signed on-chain)", () => {
+    const salted = buildRequestCommitment(buildHttpBinding(SPEC_REQUEST, []), SALT);
+    expect(salted.parts.map(p => p.name)).toEqual(["request", "salt"]);
+    expect(salted.parts[0].digest).toBe(
+      "22351cc0b694189e9feb7bab0fb3956fc1dcc0927b704406d2428e0fe821acd1",
+    );
+    expect(salted.parts[1].digest).toBe(
+      "4602db566c605e475171dc6f7ae9cafdcaa264b971d95e7c98df10c2a3a47ffc",
+    );
+    expect(salted.digest).toBe("712cdce8a4e64fc7e2b2fb3b70ba41317ff606d84e98890c65d4fd828276a621");
+    const aux = auxWith(
+      REQUEST_COMMITMENT_METADATA_LABEL,
+      encodeRequestCommitmentMetadatum("http:1", salted.digest),
+    );
+    const auxBytes = AuxiliaryData.toCBORBytes(aux);
+    expect(hex(auxBytes)).toBe(
+      "d90103a100a1190192a2617066687474703a3161685820712cdce8a4e64fc7e2b2fb3b70ba41317ff606d84e98890c65d4fd828276a621",
+    );
+  });
+
+  it("a different salt gives a different on-chain digest for the same request", () => {
+    const binding = buildHttpBinding(SPEC_REQUEST, []);
+    expect(buildRequestCommitment(binding, SALT).digest).not.toBe(
+      buildRequestCommitment(binding, "ff".repeat(32)).digest,
+    );
+  });
+
+  it.each(["", "00", "AB".repeat(32), "0x" + "00".repeat(31), 42])("rejects salt %j", salt => {
+    expect(() => validateSalt(salt)).toThrow();
+  });
 });
 
 describe("second test vector", () => {
@@ -240,6 +276,9 @@ describe("second test vector", () => {
     );
     expect(commitment.digest).toBe(
       "f2a6d890837465ce790568b4872b576e5004fb304c3c7ed061be2fb5fa988b52",
+    );
+    expect(buildRequestCommitment(binding, SALT).digest).toBe(
+      "d26cbb2a326a7c06dad25e8a21de168a5461e8c413fb6f2efe87980cfb2b778e",
     );
   });
 });
@@ -375,15 +414,45 @@ describe("client resolution", () => {
     expect(await resolveClientRequestCommitment({}, () => SPEC_REQUEST)).toBeUndefined();
   });
 
-  it("returns the digest after recomputing it from the client's own request", async () => {
+  it("returns the salted digest after recomputing it from the client's own request", async () => {
     const result = await resolveClientRequestCommitment(
       declaredFor(SPEC_REQUEST, true),
       () => SPEC_REQUEST,
+      () => SALT,
     );
     expect(result).toEqual({
       profile: "http:1",
-      hash: buildRequestCommitment(buildHttpBinding(SPEC_REQUEST, [])).digest,
+      hash: buildRequestCommitment(buildHttpBinding(SPEC_REQUEST, []), SALT).digest,
+      salt: SALT,
     });
+    expect(requestCommitmentPayloadExtension(result!)).toEqual({
+      [CARDANO_REQUEST_COMMITMENT]: { info: { salt: SALT } },
+    });
+  });
+
+  it("uses a fresh salt per payment, so two payments for one request are not linkable", async () => {
+    const a = await resolveClientRequestCommitment(
+      declaredFor(SPEC_REQUEST, true),
+      () => SPEC_REQUEST,
+    );
+    const b = await resolveClientRequestCommitment(
+      declaredFor(SPEC_REQUEST, true),
+      () => SPEC_REQUEST,
+    );
+    expect(a!.salt).toMatch(/^[0-9a-f]{64}$/);
+    expect(a!.salt).not.toBe(b!.salt);
+    expect(a!.hash).not.toBe(b!.hash);
+    expect(a!.hash).not.toBe(buildRequestCommitment(buildHttpBinding(SPEC_REQUEST, [])).digest);
+  });
+
+  it("refuses a salt source that returns a malformed salt", async () => {
+    await expect(
+      resolveClientRequestCommitment(
+        declaredFor(SPEC_REQUEST, true),
+        () => SPEC_REQUEST,
+        () => "00",
+      ),
+    ).rejects.toThrow(/salt/);
   });
 
   it("refuses a commitment for a different request, even when not required", async () => {
@@ -429,20 +498,67 @@ describe("server extension", () => {
   const verify = extension.hooks!.onBeforeVerify!;
   const requirements = () => buildRequirements(payTo, "1000000");
   const declaration = (required: boolean) => declareRequestCommitmentExtension({ required });
-  const ctx = (transaction: string, request = SPEC_REQUEST.url.replace(ORIGIN, "")) => ({
-    paymentPayload: { x402Version: 2, payload: { transaction, nonce: NONCE_REF } },
+  const ctx = (
+    transaction: string,
+    request = SPEC_REQUEST.url.replace(ORIGIN, ""),
+    salt: unknown = SALT,
+  ) => ({
+    paymentPayload: {
+      x402Version: 2,
+      payload: { transaction, nonce: NONCE_REF },
+      ...(salt === null
+        ? {}
+        : { extensions: { [CARDANO_REQUEST_COMMITMENT]: { info: { salt } } } }),
+    },
     requirements: requirements(),
     declaredExtensions: {},
     transportContext: transport({ method: "GET", url: `http://evil.example${request}` }),
   });
-  const digest = buildRequestCommitment(buildHttpBinding(SPEC_REQUEST, [])).digest;
+  /** What the server publishes in the 402 (no salt). */
+  const published = buildRequestCommitment(buildHttpBinding(SPEC_REQUEST, [])).digest;
+  /** What the buyer signs on-chain (salted). */
+  const digest = buildRequestCommitment(buildHttpBinding(SPEC_REQUEST, []), SALT).digest;
 
   it("publishes the commitment for the request, built from the public origin, not the Host", () => {
     const enriched = extension.enrichDeclaration!(
       declaration(true),
       transport({ method: "GET", url: "http://evil.example/article/A" }),
     ) as { info: { commitment: { digest: string } } };
-    expect(enriched.info.commitment.digest).toBe(digest);
+    expect(enriched.info.commitment.digest).toBe(published);
+  });
+
+  it("rejects a commitment present on-chain without a disclosed salt", async () => {
+    expect(
+      await verify(declaration(false), ctx(await signedTx(digest), undefined, null) as never),
+    ).toMatchObject({ abort: true, reason: REQUEST_COMMITMENT_ERRORS.malformed });
+  });
+
+  it("rejects a disclosed salt when the transaction carries no commitment", async () => {
+    expect(await verify(declaration(false), ctx(await signedTx()) as never)).toMatchObject({
+      abort: true,
+      reason: REQUEST_COMMITMENT_ERRORS.malformed,
+    });
+  });
+
+  it.each(["00", "AB".repeat(32), 7])("rejects a malformed salt %j", async salt => {
+    expect(
+      await verify(declaration(false), ctx(await signedTx(digest), undefined, salt) as never),
+    ).toMatchObject({ abort: true, reason: REQUEST_COMMITMENT_ERRORS.malformed });
+  });
+
+  it("rejects a salt that does not lead to the signed commitment", async () => {
+    expect(
+      await verify(
+        declaration(false),
+        ctx(await signedTx(digest), undefined, "ff".repeat(32)) as never,
+      ),
+    ).toMatchObject({ abort: true, reason: REQUEST_COMMITMENT_ERRORS.mismatch });
+  });
+
+  it("rejects an unsalted commitment (the 402 value signed as is)", async () => {
+    expect(await verify(declaration(false), ctx(await signedTx(published)) as never)).toMatchObject(
+      { abort: true, reason: REQUEST_COMMITMENT_ERRORS.mismatch },
+    );
   });
 
   it("accepts a transaction that commits to this request", async () => {
@@ -459,11 +575,11 @@ describe("server extension", () => {
 
   it("rejects a missing commitment only when required", async () => {
     const tx = await signedTx();
-    expect(await verify(declaration(true), ctx(tx) as never)).toMatchObject({
+    expect(await verify(declaration(true), ctx(tx, undefined, null) as never)).toMatchObject({
       abort: true,
       reason: REQUEST_COMMITMENT_ERRORS.missing,
     });
-    expect(await verify(declaration(false), ctx(tx) as never)).toBeUndefined();
+    expect(await verify(declaration(false), ctx(tx, undefined, null) as never)).toBeUndefined();
   });
 
   it("rejects unsigned metadata even when the commitment is optional", async () => {
@@ -507,6 +623,7 @@ describe("server extension", () => {
     // server cannot know the body is really empty and must refuse.
     const emptyPost = buildRequestCommitment(
       buildHttpBinding({ ...SPEC_REQUEST, method: "POST" }, []),
+      SALT,
     ).digest;
     const result = await verify(declaration(false), {
       ...ctx(await signedTx(emptyPost)),
@@ -603,6 +720,7 @@ describe("server extension", () => {
         },
         [],
       ),
+      SALT,
     ).digest;
     expect(
       await verify(declaration(true), {
@@ -616,6 +734,7 @@ describe("server extension", () => {
     ).toMatchObject({ abort: true });
     const doubleSlash = buildRequestCommitment(
       buildHttpBinding({ ...SPEC_REQUEST, url: "https://api.example.com//article/A" }, []),
+      SALT,
     ).digest;
     expect(
       await verify(declaration(true), {
@@ -656,6 +775,7 @@ describe("server extension", () => {
     });
     const searchDigest = buildRequestCommitment(
       buildHttpBinding(SEARCH_REQUEST, ["content-type"]),
+      SALT,
     ).digest;
     const decl = declareRequestCommitmentExtension({ required: true, headers: ["content-type"] });
     const request = {

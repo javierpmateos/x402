@@ -68,6 +68,7 @@ const JSON_SCHEMA = {
       required: ["headers"],
     },
     commitment: { type: "object" },
+    salt: { type: "string", pattern: "^[0-9a-f]{64}$" },
   },
   required: ["required", "profile", "bindingParams"],
 };
@@ -298,8 +299,10 @@ function describeRequest(
 /**
  * Creates the resource-server side of `cardano-request-commitment`.
  *
- * - `enrichDeclaration` publishes the commitment for the request that produced the 402.
- * - `onBeforeVerify` recomputes it from the paid retry and compares it with the
+ * - `enrichDeclaration` publishes the (unsalted) commitment for the request that
+ *   produced the 402.
+ * - `onBeforeVerify` recomputes it from the paid retry, extends it with the salt
+ *   the buyer disclosed in the payment payload, and compares the result with the
  *   commitment the buyer signed into the transaction.
  *
  * A commitment that is present must always be valid. Absence is rejected only
@@ -354,12 +357,16 @@ export function createRequestCommitmentServerExtension(
    * @param context - Core's verify context.
    * @param context.paymentPayload - The payment payload.
    * @param context.paymentPayload.payload - The scheme payload carrying the transaction.
+   * @param context.paymentPayload.extensions - Payload extensions carrying the salt.
    * @param context.transportContext - Core's transport context.
    * @returns An abort directive, or undefined when the commitment holds.
    */
   async function verifyCommitment(
     decl: Declaration,
-    context: { paymentPayload: { payload: unknown }; transportContext?: unknown },
+    context: {
+      paymentPayload: { payload: unknown; extensions?: unknown };
+      transportContext?: unknown;
+    },
   ) {
     const required = decl.info.required === true;
     const abort = (reason: string, message: string) => ({
@@ -372,8 +379,19 @@ export function createRequestCommitmentServerExtension(
     if (typeof transaction !== "string") {
       return abort(REQUEST_COMMITMENT_ERRORS.malformed, "payload carries no transaction");
     }
+    const echoed = (context.paymentPayload.extensions as Record<string, unknown> | undefined)?.[
+      CARDANO_REQUEST_COMMITMENT
+    ] as { info?: { salt?: unknown } } | undefined;
+    const salt = echoed?.info?.salt;
+
     const found = readRequestCommitment(transaction);
     if (found.status === "absent") {
+      if (salt !== undefined) {
+        return abort(
+          REQUEST_COMMITMENT_ERRORS.malformed,
+          "salt disclosed but the transaction carries no commitment",
+        );
+      }
       return required
         ? abort(REQUEST_COMMITMENT_ERRORS.missing, "route requires a request commitment")
         : undefined;
@@ -381,6 +399,16 @@ export function createRequestCommitmentServerExtension(
     if (found.status === "unsigned") return abort(REQUEST_COMMITMENT_ERRORS.unsigned, found.detail);
     if (found.status === "malformed")
       return abort(REQUEST_COMMITMENT_ERRORS.malformed, found.detail);
+
+    if (salt === undefined) {
+      return abort(
+        REQUEST_COMMITMENT_ERRORS.malformed,
+        "transaction carries a commitment but the payload discloses no salt",
+      );
+    }
+    if (typeof salt !== "string" || !/^[0-9a-f]{64}$/.test(salt)) {
+      return abort(REQUEST_COMMITMENT_ERRORS.malformed, "salt is not 32 bytes of lowercase hex");
+    }
 
     if (found.metadatum.profile !== decl.info.profile) {
       return abort(REQUEST_COMMITMENT_ERRORS.mismatch, "commitment uses a different profile");
@@ -394,12 +422,13 @@ export function createRequestCommitmentServerExtension(
     }
     const headers = decl.info.bindingParams.headers;
     // Recomputed from the request that will execute, with the server's own
-    // configuration. Nothing here is taken from the client's echo.
+    // configuration. Nothing here is taken from the client's echo but the salt.
     const expected = buildRequestCommitment(
       buildHttpBinding(
         describeRequest(adapter, config, headers, await bodyForVerification(adapter, config)),
         headers,
       ),
+      salt,
     );
     if (found.metadatum.hash !== expected.digest) {
       return abort(

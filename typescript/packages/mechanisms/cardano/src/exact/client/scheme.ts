@@ -18,8 +18,10 @@ import type { ClientCardanoSigner } from "../../signer";
 import type { ExactCardanoPayload } from "../../types";
 import {
   assertCommitmentEmbedded,
+  requestCommitmentPayloadExtension,
   resolveClientRequestCommitment,
   type RequestCommitmentRequestProvider,
+  type RequestCommitmentSaltSource,
 } from "../requestCommitment/client";
 
 /** Optional client behaviour. */
@@ -30,6 +32,11 @@ export interface ExactCardanoSchemeOptions {
    * request and refuses to pay if it does not match the one the server declared.
    */
   requestCommitmentRequest?: RequestCommitmentRequestProvider;
+  /**
+   * Supplies the salt mixed into the on-chain commitment. Defaults to fresh
+   * random bytes per payment, which is what a client should normally use.
+   */
+  requestCommitmentSalt?: RequestCommitmentSaltSource;
 }
 
 /**
@@ -104,6 +111,7 @@ export class ExactCardanoScheme implements SchemeNetworkClient {
     const requestCommitment = await resolveClientRequestCommitment(
       context?.extensions,
       this.options.requestCommitmentRequest,
+      this.options.requestCommitmentSalt,
     );
 
     const result = await this.signer.buildAndSignPaymentTransaction({
@@ -113,7 +121,11 @@ export class ExactCardanoScheme implements SchemeNetworkClient {
       amount: paymentRequirements.amount,
       maxTimeoutSeconds: paymentRequirements.maxTimeoutSeconds,
       extra: paymentRequirements.extra,
-      ...(requestCommitment ? { requestCommitment } : {}),
+      ...(requestCommitment
+        ? {
+            requestCommitment: { profile: requestCommitment.profile, hash: requestCommitment.hash },
+          }
+        : {}),
     });
 
     if (!result || typeof result.transaction !== "string" || result.transaction.length === 0) {
@@ -135,6 +147,10 @@ export class ExactCardanoScheme implements SchemeNetworkClient {
     return {
       x402Version,
       payload,
+      // The salt travels to the resource server here, never on-chain.
+      ...(requestCommitment
+        ? { extensions: requestCommitmentPayloadExtension(requestCommitment) }
+        : {}),
     };
   }
 }
