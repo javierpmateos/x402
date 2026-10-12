@@ -11,38 +11,38 @@ function abortReason(signal: AbortSignal): unknown {
 }
 
 /**
- * Reads a body stream to the end. Rejects as soon as any signal aborts, also
- * while a read is pending, and cancels the stream so its source stops.
+ * Reads a body stream to the end. Rejects as soon as the signal aborts, also
+ * while a read is pending, and cancels the stream so its source stops. The
+ * abort is checked again after every read, so a source that ends its own stream
+ * when aborted cannot make a partial body look complete.
  *
  * @param stream - The body stream
- * @param signals - Signals that abort the read
+ * @param signal - Aborts the read
  * @returns The body bytes
  */
 async function readStream(
   stream: ReadableStream<Uint8Array>,
-  signals: AbortSignal[],
+  signal: AbortSignal,
 ): Promise<Uint8Array> {
-  const already = signals.find(signal => signal.aborted);
-  if (already) throw abortReason(already);
+  if (signal.aborted) throw abortReason(signal);
 
   const reader = stream.getReader();
-  let onAbort: (() => void) | undefined;
+  let onAbort: () => void = () => undefined;
   const aborted = new Promise<never>((_, reject) => {
     onAbort = () => {
-      const signal = signals.find(s => s.aborted);
-      const reason = signal ? abortReason(signal) : new Error("aborted");
-      reject(reason);
-      reader.cancel(reason).catch(() => undefined);
+      reject(abortReason(signal));
+      reader.cancel(abortReason(signal)).catch(() => undefined);
     };
   });
   aborted.catch(() => undefined);
-  for (const signal of signals) signal.addEventListener("abort", onAbort!, { once: true });
+  signal.addEventListener("abort", onAbort, { once: true });
 
   try {
     const chunks: Uint8Array[] = [];
     let length = 0;
     for (;;) {
       const { done, value } = await Promise.race([reader.read(), aborted]);
+      if (signal.aborted) throw abortReason(signal);
       if (done) break;
       chunks.push(value);
       length += value.byteLength;
@@ -55,7 +55,7 @@ async function readStream(
     }
     return bytes;
   } finally {
-    for (const signal of signals) signal.removeEventListener("abort", onAbort!);
+    signal.removeEventListener("abort", onAbort);
   }
 }
 
@@ -63,13 +63,16 @@ async function readStream(
  * Describes a fetch request as the call a payment is created for.
  *
  * Method, URL and headers are captured now, before any payment header is
- * added. The body is not touched until a scheme calls `getBody`: only then is
+ * added. The body is not touched until a consumer calls `getBody`: only then is
  * `bodySource` invoked to obtain a request whose body can be consumed, so a
- * client whose schemes never bind the body pays no extra clone or read. The
- * first read is shared by later calls, which receive their own copy of the
- * bytes; a failed or aborted read stays failed rather than being retried on a
- * partially consumed stream. The read stops when the request's own signal or
- * the signal passed to `getBody` aborts.
+ * client whose schemes never bind the body pays no extra clone or read.
+ *
+ * All consumers share one read. While it is pending, the request's own signal
+ * or the signal any consumer passes to `getBody` cancels it, and every pending
+ * consumer rejects; a cancelled or failed read stays failed rather than being
+ * retried on a partially consumed stream. Once the read has completed, its
+ * bytes are kept, and each call receives its own copy (a call whose signal is
+ * already aborted still rejects).
  *
  * @param request - The original request
  * @param bodySource - Returns a request whose body may be consumed
@@ -85,19 +88,43 @@ export function httpPaymentCall(request: Request, bodySource: () => Request): Ht
   if (request.body === null) return call;
 
   let read: Promise<Uint8Array> | undefined;
+  let pending = false;
+  const cancel = new AbortController();
+  const unlink: Array<() => void> = [];
+
+  /**
+   * Lets a signal cancel the shared read while it is pending.
+   *
+   * @param signal - Signal to follow
+   */
+  const follow = (signal: AbortSignal): void => {
+    if (signal.aborted) {
+      cancel.abort(abortReason(signal));
+      return;
+    }
+    const onAbort = () => cancel.abort(abortReason(signal));
+    signal.addEventListener("abort", onAbort, { once: true });
+    unlink.push(() => signal.removeEventListener("abort", onAbort));
+  };
+
   call.getBody = (signal?: AbortSignal) => {
+    if (signal?.aborted) return Promise.reject(abortReason(signal));
     if (!read) {
+      pending = true;
+      follow(request.signal);
       read = (async () => {
-        const signals = signal ? [request.signal, signal] : [request.signal];
-        const already = signals.find(s => s.aborted);
-        if (already) throw abortReason(already);
+        if (cancel.signal.aborted) throw abortReason(cancel.signal);
         const source = bodySource();
         if (source.bodyUsed) throw new Error("request_body_already_used");
         if (source.body === null) return new Uint8Array(0);
-        return readStream(source.body, signals);
-      })();
+        return readStream(source.body, cancel.signal);
+      })().finally(() => {
+        pending = false;
+        for (const remove of unlink.splice(0)) remove();
+      });
       read.catch(() => undefined);
     }
+    if (signal && pending) follow(signal);
     return read.then(bytes => bytes.slice());
   };
   return call;

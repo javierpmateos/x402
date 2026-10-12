@@ -198,7 +198,108 @@ describe("httpPaymentCall", () => {
     expect(cancels).toBeGreaterThan(0);
     expect(await outcome(call.getBody?.(), 200)).toBe("rejected");
   });
+
+  it("lets a later consumer's signal abort a read another consumer started", async () => {
+    let pulls = 0;
+    const stream = hangingStream(() => (pulls += 1));
+    const request = new Request("https://pay.example/later-signal", {
+      method: "POST",
+      body: stream,
+      duplex: "half",
+    } as RequestInit);
+    const call = httpPaymentCall(request, () => request);
+    const hookRead = call.getBody?.();
+    await waitFor(() => pulls >= 2, "the hung pull");
+    const controller = new AbortController();
+    const schemeRead = call.getBody?.(controller.signal);
+    controller.abort();
+
+    expect(await outcome(schemeRead, 400)).toBe("rejected");
+    expect(await outcome(hookRead, 400)).toBe("rejected");
+  });
+
+  it("never resolves partial bytes when consumers sharing a signal abort mid-read", async () => {
+    for (let round = 0; round < 20; round++) {
+      let pulls = 0;
+      const stream = hangingStream(() => (pulls += 1));
+      const request = new Request("https://pay.example/shared-signal", {
+        method: "POST",
+        body: stream,
+        duplex: "half",
+      } as RequestInit);
+      const call = httpPaymentCall(request, () => request);
+      const controller = new AbortController();
+      const first = call.getBody?.(controller.signal);
+      const second = call.getBody?.(controller.signal);
+      await waitFor(() => pulls >= 2, "the hung pull");
+      controller.abort();
+
+      expect(await outcome(first, 400)).toBe("rejected");
+      expect(await outcome(second, 400)).toBe("rejected");
+    }
+  });
+
+  it("rejects instead of returning partial bytes when the source ends itself on abort", async () => {
+    const controller = new AbortController();
+    const encoder = new TextEncoder();
+    let reads = 0;
+    let endPending: (() => void) | undefined;
+    // A source that closes its own stream when the signal aborts, before any
+    // listener the reader adds later runs: the pending read resolves `done`.
+    controller.signal.addEventListener("abort", () => endPending?.());
+    const reader = {
+      read: () => {
+        reads += 1;
+        if (reads === 1) return Promise.resolve({ done: false, value: encoder.encode("partial") });
+        return new Promise(resolve => {
+          endPending = () => resolve({ done: true, value: undefined });
+        });
+      },
+      cancel: () => Promise.resolve(),
+    };
+    const source = { bodyUsed: false, body: { getReader: () => reader } } as unknown as Request;
+    const request = new Request("https://pay.example/self-ending", {
+      method: "POST",
+      body: "x",
+      signal: controller.signal,
+    });
+    const call = httpPaymentCall(request, () => source);
+    const pending = call.getBody?.();
+    await waitFor(() => reads >= 2, "the pending read");
+    controller.abort();
+
+    expect(await outcome(pending, 400)).toBe("rejected");
+  });
+
+  it("keeps completed bytes when a later consumer's signal is already aborted", async () => {
+    const request = new Request("https://pay.example/cached", { method: "POST", body: "abc" });
+    const call = httpPaymentCall(request, () => request.clone());
+    expect(new TextDecoder().decode(await call.getBody?.())).toBe("abc");
+
+    const controller = new AbortController();
+    controller.abort();
+    await expect(call.getBody?.(controller.signal)).rejects.toBeTruthy();
+    expect(new TextDecoder().decode(await call.getBody?.())).toBe("abc");
+  });
 });
+
+/**
+ * A body stream that yields one chunk and then never produces another.
+ *
+ * @param onPull - Called on every pull
+ * @returns The stream
+ */
+function hangingStream(onPull: () => number): ReadableStream<Uint8Array> {
+  return new ReadableStream({
+    pull(controller) {
+      if (onPull() === 1) {
+        controller.enqueue(new TextEncoder().encode("partial"));
+        return;
+      }
+      return new Promise(() => undefined);
+    },
+  });
+}
 
 describe("wrapFetchWithPayment call context", () => {
   it("passes the original call to the first payment and to recovery", async () => {
