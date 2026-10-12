@@ -48,12 +48,45 @@ export type PaymentPayloadResult = Pick<PaymentPayload, "x402Version" | "payload
 };
 
 /**
+ * The HTTP request a payment is being created for.
+ *
+ * `headers` has lowercase names and never carries `payment-signature` or
+ * `x-payment`. `getBody` is present only when the request has a body and is
+ * read lazily: a scheme that does not bind the body never triggers a read.
+ */
+export interface HttpPaymentCall {
+  kind: "http";
+  method: string;
+  url: string;
+  headers: Readonly<Record<string, string>>;
+  getBody?: (signal?: AbortSignal) => Promise<Uint8Array>;
+}
+
+/**
+ * The MCP tool call a payment is being created for. `arguments` is a frozen
+ * snapshot of the arguments the client transmits with the call.
+ */
+export interface McpPaymentCall {
+  kind: "mcp";
+  toolName: string;
+  arguments: Readonly<Record<string, unknown>>;
+}
+
+/**
+ * The call a payment is being created for, discriminated by transport.
+ * Passed per call, so concurrent payments on one client never share it.
+ */
+export type PaymentCall = HttpPaymentCall | McpPaymentCall;
+
+/**
  * Context passed to scheme `createPaymentPayload`.
  * `maxAmountPerPayment` is the resolved atomic spend cap; omitted when uncapped.
  */
 export interface PaymentPayloadContext {
   extensions?: Record<string, unknown>;
   maxAmountPerPayment?: string;
+  /** The call being paid for, when the transport supplied it. */
+  call?: PaymentCall;
 }
 
 export interface SchemeClientHooks {
