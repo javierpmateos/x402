@@ -59,6 +59,18 @@ export interface HttpPaymentCall {
   method: string;
   url: string;
   headers: Readonly<Record<string, string>>;
+  /**
+   * Reads the request body. Every caller (hooks and the scheme) shares one read
+   * and receives its own copy of the bytes.
+   *
+   * - A `signal` that is already aborted rejects only that call; a read already
+   *   in progress for other callers continues.
+   * - A `signal` that aborts while the shared read is in progress cancels it, and
+   *   every caller waiting on it rejects. The request's own signal does the same.
+   * - A cancelled or failed read stays failed; it is never retried on a partially
+   *   consumed stream, so a partial body is never returned.
+   * - Once the read has completed, its bytes are kept for later calls.
+   */
   getBody?: (signal?: AbortSignal) => Promise<Uint8Array>;
 }
 

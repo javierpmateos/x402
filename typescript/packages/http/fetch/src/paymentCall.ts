@@ -67,12 +67,13 @@ async function readStream(
  * `bodySource` invoked to obtain a request whose body can be consumed, so a
  * client whose schemes never bind the body pays no extra clone or read.
  *
- * All consumers share one read. While it is pending, the request's own signal
- * or the signal any consumer passes to `getBody` cancels it, and every pending
- * consumer rejects; a cancelled or failed read stays failed rather than being
- * retried on a partially consumed stream. Once the read has completed, its
- * bytes are kept, and each call receives its own copy (a call whose signal is
- * already aborted still rejects).
+ * All consumers share one read, with the contract documented on
+ * `HttpPaymentCall.getBody`: a signal that is already aborted rejects only its
+ * own call and leaves a read in progress running; a signal that aborts while
+ * the read is in progress (or the request's own signal) cancels it for every
+ * waiting consumer; a cancelled or failed read stays failed rather than being
+ * retried on a partially consumed stream; completed bytes are kept, and each
+ * call receives its own copy.
  *
  * @param request - The original request
  * @param bodySource - Returns a request whose body may be consumed
