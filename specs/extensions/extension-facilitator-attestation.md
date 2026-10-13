@@ -1,7 +1,7 @@
 # Facilitator Attestation Extension
 
 **Status:** Draft
-**Version:** 1.0 (draft revision 2 — see [Changelog](#changelog))
+**Version:** 1.0 (draft revision 3 — see [Changelog](#changelog))
 **Extension Key:** `facilitator-attestation`
 **Placement:** `SettlementResponse.extensions["facilitator-attestation"]`
 
@@ -39,7 +39,7 @@ The facilitator is the natural signer because it is the party that submitted the
 
 A `SettlementAttestation` **attributes** a settlement to a payer, payee, asset and amount. It does **not** establish that the settlement occurred. Whether value moved is a fact of the settlement network, not of this signature.
 
-Consumers that act on an attestation MUST either run the settlement check in §6.3 or already hold independent evidence that the value arrived (for example, a contract that can observe its own balance). Under this rule a facilitator that signs a false attestation can misattribute a settlement that exists, but cannot make a consumer credit one that does not.
+Consumers that act on an attestation MUST either obtain a `MATCH` from the settlement check in §6.3 or already hold independent evidence that the value arrived (for example, a contract that can observe its own balance). Under this rule a facilitator that signs a false attestation can misattribute a settlement that exists, but cannot make a consumer credit one that does not.
 
 This is the same boundary offer-and-receipt draws for delivery — a receipt is proof of emission, not proof of validity — applied to settlement.
 
@@ -240,13 +240,16 @@ As in offer-and-receipt §4.5.1, a valid signature proves that a key signed the 
 
 **6.3 Settlement Check**
 
-A consumer that did not already observe the value arriving (§2.1) MUST look up `(network, transaction)` on the settlement network and compare the settlement against the attested `payer`, `payee`, `asset` and `amount`. The check has **three** outcomes, and they MUST be kept distinct:
+A consumer that did not already observe the value arriving (§2.1) MUST look up `(network, transaction)` on the settlement network and compare the settlement against the attested `payer`, `payee`, `asset` and `amount`. The check has **four** outcomes, and they MUST be kept distinct:
 
 | Outcome | Meaning | Consumer action |
 |---|---|---|
-| `NOT_FOUND` | No settlement identified by `(network, transaction)` at the depth the consumer requires | MUST NOT treat as verified. MAY retry: the settlement can be pending or reorganized. Not, by itself, evidence of misbehavior. |
+| `NOT_FOUND` | The lookup completed, and no settlement identified by `(network, transaction)` exists at the depth the consumer requires | MUST NOT treat as verified. MAY retry: the settlement can be pending or reorganized. Not, by itself, evidence of misbehavior. |
 | `MATCH` | Found, and every compared field matches | Verified, within the limits of §2.1. |
 | `MISMATCH` | Found, but at least one compared field differs | MUST reject. A validly signed attestation that contradicts the settlement it names is evidence of facilitator error or misbehavior; consumers SHOULD retain it. |
+| `UNAVAILABLE` | The lookup could not be completed: the data source was unreachable, returned an error or timed out, or the consumer cannot establish that it is current | MUST NOT treat as verified. MUST NOT treat as evidence about the facilitator or the settlement. MAY retry. |
+
+`NOT_FOUND` and `MISMATCH` are findings about the settlement; `UNAVAILABLE` is a finding about the consumer's own access to the network. A consumer MUST report `NOT_FOUND` or `MISMATCH` only from a lookup it completed against a source it trusts to be current, and MUST report `UNAVAILABLE` otherwise. An outage on the consumer's side must never read as a facilitator having attested a settlement that does not exist, or one that does not match.
 
 `payer` MUST be compared against the binding's funding account (§4.3), never against "any party to the transaction". On Hedera the facilitator is genuinely a party to every transaction it sponsors, so a membership check would classify a facilitator-as-payer attestation as `MATCH` when it is a `MISMATCH`.
 
@@ -335,6 +338,10 @@ This extension:
 ---
 
 **Changelog**
+
+**Draft revision 3**
+
+- Settlement check gains a fourth outcome, `UNAVAILABLE`, for a lookup that could not be completed (§6.3). `NOT_FOUND` and `MISMATCH` may only come from a completed lookup against a current source, so a consumer's infrastructure failure is never reported as a finding about the facilitator. §2.1 now requires a `MATCH`, not just running the check.
 
 **Draft revision 2** — folds in corrections from review on [#1802](https://github.com/x402-foundation/x402/issues/1802):
 
